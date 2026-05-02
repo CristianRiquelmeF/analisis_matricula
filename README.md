@@ -4,7 +4,24 @@
 Este repositorio contiene la solución técnica para el cálculo de continuidad de estudios y matrícula asegurada del proceso SAE 2019. El proyecto se estructuró en dos fases: un análisis exploratorio para la auditoría y prototipado de los datos, y la construcción de un pipeline de producción automatizado para la generación de los entregables solicitados.
 
 El objetivo central es procesar las bases históricas del Ministerio de Educación, validando la oferta de cursos vigente y determinando los estudiantes que cumplen con los requisitos estructurales e institucionales para mantener su cupo en el establecimiento de origen.
-Estructura de Archivos
+
+
+**Arquitectura del proyecto:**
+
+```
+analisis_matricula/
+├── data/
+│   ├── processed/          # Directorio destino para los outputs (CSV resultantes)
+│   └── raw/                # Directorio para alojar las bases originales del Ministerio
+├── notebooks/
+│   └── 01_analisis_matricula_asegurada.ipynb  # Entorno de prototipado, limpieza y EDA
+├── src/
+│   └── pipeline_sae.py     # Motor principal automatizado
+├── .gitignore              
+├── README.md               # Documentación
+└── requirements.txt        # Dependencias de Python (pandas, matplotlib, etc.)
+```
+Los archivos CSV originales y procesados son ignorados en el control de versiones por políticas de volumen y privacidad de datos.
 
 **La entrega se compone de los siguientes elementos principales**:
 
@@ -40,7 +57,7 @@ La ejecución del modelo sobre los datos históricos arrojó los siguientes hall
 
 **Reproducibilidad del Pipeline**
 
-1. Clonación del Repositorio para evaluadores o analistas con archivos csv originales. 
+1. Clonación del Repositorio para **evaluadores o analistas con archivos csv originales.** 
 
 **Este repositorio no contiene ningún archivo csv por seguridad de la información, sólo código práctico.**
 
