@@ -14,10 +14,6 @@ __pycache__/
 *$py.class
 .ipynb_checkpoints/
 
-# Imágenes temporales sueltas
-image.png
-image-1.png
-
 # Archivos ocultos del Sistema Operativo
 .DS_Store
 Thumbs.db
