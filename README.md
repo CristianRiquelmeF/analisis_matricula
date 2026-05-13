@@ -53,7 +53,7 @@ La ejecución del modelo sobre los datos históricos arrojó los siguientes hall
 
 **Captura de comprobación de correcto funcionamiento de pipeline**
 
-![alt text](image-2.png)
+![alt text](image-1.png)
 
 ---
 
