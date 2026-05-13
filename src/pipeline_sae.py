@@ -1,150 +1,207 @@
 import pandas as pd
-import os
 import logging
+from pathlib import Path
 
-# Configuración de logging para registrar la ejecución del pipeline
+# =========================================================
+# CONFIGURACIÓN GLOBAL
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# Función para cargar archivos csv con diferentes separadores evitando errores de lectura.
+OUTPUT_SEP = "|"
+FECHA_CORTE_EDAD = pd.Timestamp("2019-03-31")
 
-def cargar_csv_seguro(ruta, usecols=None):
-    """Carga archivos CSV intentando múltiples separadores para evitar errores de codificación."""
-    separadores = [';', ',', '|']
-    
+# =========================================================
+# FUNCIONES AUXILIARES (ETL ROBUSTO)
+
+
+def cargar_csv_seguro(ruta, usecols=None, dtype=None):
+    """Carga CSV con tolerancia a múltiples separadores y normaliza cabeceras."""
+    separadores = ["|", ";", ","]
     for sep in separadores:
         try:
-            df = pd.read_csv(ruta, sep=sep, encoding='latin-1', usecols=usecols)
-            
+            df = pd.read_csv(
+                ruta, sep=sep, encoding="latin-1", 
+                usecols=usecols, dtype=dtype, low_memory=False
+            )
             if usecols is None and len(df.columns) == 1:
-                continue # Prueba con el siguiente separador
-                
-            return df # Si llegó aquí sin errores, el separador funcionó perfectamente
+                continue
             
-        except ValueError:
-            # Separador incorrecto para el usecols pedido, intentamos con el siguiente
-            continue 
-        except Exception as e:
-            logging.error(f"Error al cargar {ruta}: {e}")
-            raise
-            
-    # Si termina el ciclo y no retornó, las columnas de usecols realmente no existen
-    raise ValueError(f"No se pudieron encontrar las columnas en {ruta} con los separadores conocidos.")
+            # Normalización estricta de nombres de columnas
+            df.columns = df.columns.str.strip().str.lower()
+            return df
+        except Exception:
+            continue
+    raise ValueError(f"Fallo crítico: No fue posible leer {ruta} con los separadores conocidos.")
 
-# Función para el desarrollo del paso n°1 sobre oferta 2019, entrega csv con datos procesados
+def auditar_dimensiones(df, nombre_paso):
+    """Registra en el log el volumen de datos actual."""
+    logging.info(f"[{nombre_paso}] -> {df.shape[0]} filas | {df.shape[1]} columnas")
 
-def generar_oferta_2019(rutas, ruta_salida):
-    """Ejecuta el Paso 1: Obtención de la Oferta 2019."""
-    logging.info("Iniciando Paso 1: Generación de Oferta 2019...")
+def calcular_edad_exacta(fecha_nac, fecha_ref):
+    """Cálculo determinista de edad en años cumplidos, resistente a años bisiestos."""
+    edad = (
+        fecha_ref.year - fecha_nac.dt.year -
+        (
+            (fecha_nac.dt.month > fecha_ref.month) | 
+            ((fecha_nac.dt.month == fecha_ref.month) & (fecha_nac.dt.day > fecha_ref.day))
+        ).astype(int)
+    )
+    return edad
+
+# =========================================================
+# PASO 1: CONSTRUCCIÓN DE LA OFERTA VÁLIDA
+
+
+def generar_oferta_2019(rutas, salida):
+    logging.info("Iniciando Paso 1: Generación de Oferta 2019")
+
+    ficha = cargar_csv_seguro(rutas["ficha"])
+    log = cargar_csv_seguro(rutas["log"], dtype={"rbd": "Int64", "id_log_cupo": "Int64"})
+    anexo = cargar_csv_seguro(rutas["anexo"])
+    admi = cargar_csv_seguro(rutas["admi"])
+    coles = cargar_csv_seguro(rutas["coles"], dtype={"rbd": "Int64"})
+
+    # 1. Filtro de Logs Válidos (Preservando múltiples cursos por RBD)
+    log["fecha_ultima_actualizacion"] = pd.to_datetime(log["fecha_ultima_actualizacion"], errors="coerce")
+    log_valido = log[log["cargado_vitrina"] == 1].copy()
     
-    df_ficha = cargar_csv_seguro(rutas['ficha'])
-    df_log = cargar_csv_seguro(rutas['log'], usecols=['RBD', 'ID_LOG_CUPO', 'FECHA_ULTIMA_ACTUALIZACION', 'CARGADO_VITRINA'])
-    df_anexo = cargar_csv_seguro(rutas['anexo'])
-    df_admi = cargar_csv_seguro(rutas['admi'])
-    df_coles = cargar_csv_seguro(rutas['coles'])
+    # Ordenamos y nos quedamos con la última actualización por cada declaración (id_log_cupo)
+    log_valido = log_valido.sort_values(["rbd", "fecha_ultima_actualizacion", "id_log_cupo"])
+    log_valido = log_valido.drop_duplicates(subset=["rbd", "id_log_cupo"], keep="last")
+    
+    oferta = ficha[ficha["id_log_cupo"].isin(log_valido["id_log_cupo"])].copy()
 
-    # Estandarizar columnas a minúsculas
-    for df in [df_log, df_anexo, df_coles]:
-        df.columns = df.columns.str.lower()
+    # 2. Cruce con Anexos para determinar Sede
+    anexo = anexo.rename(columns={"id_anexo": "id_sede_anexo"})
+    oferta = oferta.merge(anexo[["id_sede_anexo", "n_correlativo"]], on="id_sede_anexo", how="left", validate="many_to_one")
+    oferta["cod_sede"] = oferta["n_correlativo"].fillna(1).astype(int)
 
-    # Regla 1: Última actualización válida
-    log_valido = df_log[df_log['cargado_vitrina'] == 1].copy()
-    log_valido['fecha_ultima_actualizacion'] = pd.to_datetime(log_valido['fecha_ultima_actualizacion'])
-    idx_max = log_valido.groupby('rbd')['fecha_ultima_actualizacion'].idxmax()
-    ids_validos = log_valido.loc[idx_max, 'id_log_cupo'].tolist()
-    oferta = df_ficha[df_ficha['id_log_cupo'].isin(ids_validos)].copy()
+    # 3. Limpieza de Cupos
+    oferta["total_cupos"] = pd.to_numeric(oferta["total_cupos"], errors="coerce")
+    oferta = oferta[oferta["total_cupos"] > 0]
 
-    # Regla 2: Anexos y sedes
-    oferta = oferta.merge(df_anexo[['id_anexo', 'n_correlativo']], left_on='id_sede_anexo', right_on='id_anexo', how='left')
-    oferta['cod_sede'] = oferta['n_correlativo'].fillna(1).astype(int)
+    # 4. Homologación de llaves para cruce con catálogo de cursos
+    oferta["cod_genero"] = oferta["tipo_alumnado"]
+    oferta["cod_jor"] = oferta["tipo_jornada"]
+    oferta["cod_esp"] = pd.to_numeric(oferta["cod_esp"], errors="coerce").replace([99, 999, 9999, 99999], 0).fillna(0).astype(int)
+    admi["cod_esp"] = pd.to_numeric(admi["cod_esp"], errors="coerce").fillna(0).astype(int)
 
-    # Regla 3: Cupos mayores a 0
-    oferta = oferta[oferta['total_cupos'] > 0]
+    llaves_cruce = ["cod_gra", "cod_ens", "cod_esp", "cod_sede", "cod_genero", "cod_jor"]
 
-    # Regla 4: Emparejamiento de cursos
-    oferta['cod_genero'] = oferta['tipo_alumnado']
-    oferta['cod_jor'] = oferta['tipo_jornada']
-    oferta['cod_esp'] = oferta['cod_esp'].fillna(0).astype(int)
-    df_admi['cod_esp'] = df_admi['cod_esp'].fillna(0).astype(int)
-
-    oferta_final = oferta.merge(
-        df_admi[['cod_curso', 'cod_nivel', 'cod_gra', 'cod_ens', 'cod_esp', 'cod_genero', 'cod_jor', 'cod_sede']],
-        on=['cod_gra', 'cod_ens', 'cod_esp', 'cod_sede', 'cod_genero', 'cod_jor'],
-        how='inner'
+    oferta = oferta.merge(
+        admi[["cod_curso", "cod_nivel"] + llaves_cruce],
+        on=llaves_cruce, how="inner", validate="many_to_one"
     )
 
-    # Regla 5: Filtro oficial SAE
-    oferta_final = oferta_final.merge(df_coles[['rbd']], on='rbd', how='inner')
-    oferta_final = oferta_final[['rbd', 'cod_nivel', 'cod_curso', 'total_cupos']]
-    oferta_final['total_cupos'] = oferta_final['total_cupos'].astype(int)
-    oferta_final.to_csv(ruta_salida, index=False)
-    logging.info(f"Paso 1 completado. Total cursos: {len(oferta_final)}. Exportado a {ruta_salida}")
+# 5. Filtro final por colegios vigentes SAE
+    oferta = oferta.merge(coles[["rbd"]], on="rbd", how="inner", validate="many_to_one")
 
-# Función para el desarrollo del paso n°2 sobre matrícula asegurada, entrega csv con datos procesados
+    # 6. Ordenamos por RBD, luego por curso, y finalmente por el ID del log (cronológico)
+    # Nos quedamos con la última declaración (keep='last') en caso de que hayan actualizado cupos.
+    oferta = oferta.sort_values(by=["rbd", "cod_curso", "id_log_cupo"], ascending=[True, True, True])
+    oferta = oferta.drop_duplicates(subset=["rbd", "cod_nivel", "cod_curso"], keep="last")
 
-def generar_estudiantes_preinscribir(rutas, ruta_salida):
-    """Ejecuta el Paso 2: Identificación de estudiantes para preinscripción."""
-    logging.info("Iniciando Paso 2: Cálculo de Matrícula Asegurada...")
-
-    df_oferta_test = cargar_csv_seguro(rutas['oferta_test'])
-    df_fus = cargar_csv_seguro(rutas['fusiones'])
-    df_cod = cargar_csv_seguro(rutas['codigos_nivel'])
-
-    cols_mat = ['rbd', 'fecha_incorporacion', 'fecha_retiro', 'cod_ens', 'cod_gra', 'sal_run', 'sal_fec_nac', 'cod_region', 'tipo_dependencia']
-    df_mat = cargar_csv_seguro(rutas['matricula'], usecols=cols_mat)
-
-    # Filtros base
-    ens_regular = [10, 110, 310, 410, 510, 610, 710, 810, 910]
-    df_mat = df_mat[df_mat['cod_ens'].isin(ens_regular)]
-    df_mat = df_mat[df_mat['fecha_retiro'].isna() | (df_mat['fecha_retiro'].astype(str).str.strip() == '')]
-
-    # Filtro de edad
-    df_mat['sal_fec_nac'] = pd.to_datetime(df_mat['sal_fec_nac'], errors='coerce', dayfirst=True)
-    df_mat['edad_2019'] = 2019 - df_mat['sal_fec_nac'].dt.year - (df_mat['sal_fec_nac'].dt.month > 3).astype(int)
-    df_mat = df_mat[df_mat['edad_2019'] >= 4]
-
-    # Niveles y desduplicación
-    df_mat = df_mat.merge(df_cod, on=['cod_ens', 'cod_gra'], how='inner')
-    df_mat = df_mat[df_mat['cod_nivel'] >= -1]
+    # Formato final y exportación
+    oferta_final = oferta[["rbd", "cod_nivel", "cod_curso", "total_cupos"]].copy()
+    oferta_final = oferta_final.astype({"rbd": int, "cod_nivel": int, "total_cupos": int})
     
-    df_mat['fecha_incorporacion'] = pd.to_datetime(df_mat['fecha_incorporacion'], errors='coerce', dayfirst=True)
-    df_mat = df_mat.sort_values('fecha_incorporacion', ascending=False).drop_duplicates(subset=['sal_run'], keep='first')
+    # Comprobación de integridad 
+    if oferta_final.duplicated(subset=["rbd", "cod_nivel", "cod_curso"]).sum() > 0:
+        raise ValueError("Error de integridad: Cursos duplicados en la oferta final.")
 
-    # Mapeo de Continuidad
-    df_mat = df_mat.merge(df_fus[['rbd', 'rbd_principal']], on='rbd', how='left')
-    df_mat['rbd_2019'] = df_mat['rbd_principal'].fillna(df_mat['rbd']).astype(int)
-    df_mat['cod_nivel_2019'] = df_mat['cod_nivel'] + 1
+    oferta_final.to_csv(salida, sep=OUTPUT_SEP, index=False)
+    auditar_dimensiones(oferta_final, "Oferta 2019 Final")
 
-    oferta_pares = df_oferta_test[['rbd', 'cod_nivel']].drop_duplicates()
-    oferta_pares.rename(columns={'rbd': 'rbd_2019', 'cod_nivel': 'cod_nivel_2019'}, inplace=True)
+# =========================================================
+# PASO 2: CÁLCULO DE CONTINUIDAD DE MATRÍCULA
 
-    df_final = df_mat.merge(oferta_pares, on=['rbd_2019', 'cod_nivel_2019'], how='inner')
-    df_final = df_final[['sal_run', 'rbd_2019', 'cod_nivel_2019']]
 
-    df_final.to_csv(ruta_salida, index=False)
-    logging.info(f"Paso 2 completado. Total estudiantes: {len(df_final)}. Exportado a {ruta_salida}")
+def generar_estudiantes_preinscribir(rutas, salida):
+    logging.info("Iniciando Paso 2: Cálculo de Matrícula Asegurada")
+
+    oferta_test = cargar_csv_seguro(rutas["oferta_test"])
+    fusiones = cargar_csv_seguro(rutas["fusiones"])
+    codigos = cargar_csv_seguro(rutas["codigos_nivel"])
+    
+    # Optimizamos RAM cargando solo lo necesario
+    cols_mat = ['sal_run', 'rbd', 'fecha_incorporacion', 'fecha_retiro', 'cod_ens', 'cod_gra', 'sal_fec_nac']
+    matricula = cargar_csv_seguro(rutas["matricula"], usecols=cols_mat)
+    auditar_dimensiones(matricula, "Ingesta Matrícula Bruta")
+
+    # 1. Transformación de fechas
+    matricula["fecha_incorporacion"] = pd.to_datetime(matricula["fecha_incorporacion"], format="%Y-%m-%d", errors="coerce")
+    matricula["fecha_retiro"] = pd.to_datetime(matricula["fecha_retiro"], format="%Y-%m-%d", errors="coerce")
+    matricula["sal_fec_nac"] = pd.to_datetime(matricula["sal_fec_nac"], format="%Y-%m-%d", errors="coerce")
+
+    # 2. Filtros Normativos Base (Aplicados tempranamente para liberar RAM)
+    matricula = matricula[matricula["fecha_retiro"].isna()]
+    matricula = matricula[matricula["cod_ens"].isin([10, 110, 310, 410, 510, 610, 710, 810, 910])]
+    
+    matricula["edad_2019"] = calcular_edad_exacta(matricula["sal_fec_nac"], FECHA_CORTE_EDAD)
+    matricula = matricula[matricula["edad_2019"] >= 4]
+
+    # 3. Asignación de Nivel Actual y Filtro de Prekinder
+    matricula = matricula.merge(codigos[["cod_ens", "cod_gra", "cod_nivel"]], on=["cod_ens", "cod_gra"], how="inner", validate="many_to_one")
+    matricula = matricula[matricula["cod_nivel"] >= -1]
+    matricula["cod_nivel_2019"] = matricula["cod_nivel"] + 1
+
+    # 4. Tratamiento de Fusiones (Proyección del RBD)
+    fusiones = fusiones.rename(columns={"rbd_principal": "rbd_2019"})
+    matricula = matricula.merge(fusiones[["rbd", "rbd_2019"]], on="rbd", how="left")
+    matricula["rbd_2019"] = matricula["rbd_2019"].fillna(matricula["rbd"]).astype(int)
+
+    # 5. Cruce Estructural con Oferta 2019
+    oferta_pares = oferta_test[["rbd", "cod_nivel"]].drop_duplicates().rename(columns={"rbd": "rbd_2019", "cod_nivel": "cod_nivel_2019"})
+    matricula = matricula.merge(oferta_pares, on=["rbd_2019", "cod_nivel_2019"], how="inner")
+    
+    auditar_dimensiones(matricula, "Matrícula Post-Filtros y Continuidad")
+
+    # 6. Resolución de Conflictos (Duplicidad)
+    # Ordenamos: RUN -> Fecha (Más reciente) -> RBD (Priorizar mayor como desempate determinista)
+    matricula = matricula.sort_values(["sal_run", "fecha_incorporacion", "rbd_2019"], ascending=[True, False, False])
+    matricula = matricula.drop_duplicates(subset=["sal_run"], keep="first")
+
+    # Formato final y exportación
+    final = matricula[["sal_run", "rbd_2019", "cod_nivel_2019"]].copy()
+    final = final.astype({"rbd_2019": int, "cod_nivel_2019": int})
+
+    # Auditoría Final Restrictiva
+    if final["sal_run"].duplicated().sum() > 0:
+        raise ValueError("Error de integridad: RUNs duplicados en la nómina de preinscripción.")
+
+    final.to_csv(salida, sep=OUTPUT_SEP, index=False)
+    auditar_dimensiones(final, "Nómina Final Preinscripción")
+
+# =========================================================
+# EJECUCIÓN DEL PIPELINE
+
 
 if __name__ == "__main__":
-    # Asegurar que exista el directorio de salida
-    os.makedirs('../data/processed', exist_ok=True)
+    Path("../data/processed").mkdir(parents=True, exist_ok=True)
 
     RUTAS = {
-        'ficha': '../data/raw/SIGE_SAE_LOG_FICHA_CUPO_versionTest.csv',
-        'log': '../data/raw/SIGE_SAE_LOG_CUPO_versionTest.csv',
-        'anexo': '../data/raw/SIGE_SAE_LOG_ANEXO_SEDE_versionTest.csv',
-        'admi': '../data/raw/ADMI_CURSO_versionTest.csv',
-        'coles': '../data/raw/colesSAE_versionTest.csv',
-        'oferta_test': '../data/raw/1_oferta_2019_test.csv',
-        'fusiones': '../data/raw/fusionesAnexos_versionTest.csv',
-        'codigos_nivel': '../data/raw/codigos_ens_grado_a_nivel_versionTest.csv',
-        'matricula': '../data/raw/MATRICULA2018_versionTest.csv'
+        "ficha": "../data/raw/SIGE_SAE_LOG_FICHA_CUPO_versionTest.csv",
+        "log": "../data/raw/SIGE_SAE_LOG_CUPO_versionTest.csv",
+        "anexo": "../data/raw/SIGE_SAE_LOG_ANEXO_SEDE_versionTest.csv",
+        "admi": "../data/raw/ADMI_CURSO_versionTest.csv",
+        "coles": "../data/raw/colesSAE_versionTest.csv",
+        "oferta_test": "../data/raw/1_oferta_2019_test.csv",
+        "fusiones": "../data/raw/fusionesAnexos_versionTest.csv",
+        "codigos_nivel": "../data/raw/codigos_ens_grado_a_nivel_versionTest.csv",
+        "matricula": "../data/raw/MATRICULA2018_versionTest.csv"
     }
 
     try:
-        generar_oferta_2019(RUTAS, '../data/processed/1_oferta_2019.csv')
-        generar_estudiantes_preinscribir(RUTAS, '../data/processed/2_estudiantes_a_preinscribir.csv')
-        logging.info("Pipeline ejecutado con éxito en su totalidad.")
+        generar_oferta_2019(RUTAS, "../data/processed/1_oferta_2019.csv")
+        generar_estudiantes_preinscribir(RUTAS, "../data/processed/2_estudiantes_a_preinscribir.csv")
+        logging.info("✅ PIPELINE SAE COMPLETADO EXITOSAMENTE")
     except Exception as e:
-        logging.critical(f"Fallo crítico en el pipeline: {e}")
+        logging.exception(f"❌ ERROR CRÍTICO EN EL PIPELINE: {e}")
+        raise
+    
+    
+
